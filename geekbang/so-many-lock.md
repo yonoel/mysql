@@ -1,0 +1,181 @@
+# 21 | 为什么我只改一行的语句，锁这么多？
+
+首先说明一下，这些加锁规则我没在别的地方看到过有类似的总结，以前我自己判断的时候都是想着代码里面的实现来脑补的。这次为了总结成不看代码的同学也能理解的规则，是我又重新刷了代码临时总结出来的。所以，这个规则有以下两条前提说明：
+
+1. MySQL 后面的版本可能会改变加锁策略，所以这个规则只限于截止到现在的最新版本，即 5.x 系列 <=5.7.24，8.0 系列 <=8.0.13。
+2. 如果大家在验证中有发现 bad case 的话，请提出来，我会再补充进这篇文章，使得一起学习本专栏的所有同学都能受益。
+3. 因为间隙锁在可重复读隔离级别下才有效，所以本篇文章接下来的描述，若没有特殊说明，默认是可重复读隔离级别。
+
+我总结的加锁规则里面，包含了两个“原则”、两个“优化”和一个“bug”。
+
+## role
+
+1. 原则 1：加锁的基本单位是 next-key lock。希望你还记得，next-key lock 是前开后闭区间。
+2. 原则 2：查找过程中访问到的对象才会加锁。
+3. 优化 1：索引上的等值查询，给唯一索引加锁的时候，next-key lock 退化为行锁。
+4. 优化 2：索引上的等值查询，向右遍历时且最后一个值不满足等值条件的时候，next-key lock 退化为间隙锁。
+5. 一个 bug：唯一索引上的范围查询会访问到不满足条件的第一个值为止。
+
+```sql
+CREATE TABLE `t` (
+  `id` int(11) NOT NULL,
+  `c` int(11) DEFAULT NULL,
+  `d` int(11) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `c` (`c`)
+) ENGINE=InnoDB;
+
+insert into t values(0,0,0),(5,5,5),
+(10,10,10),(15,15,15),(20,20,20),(25,25,25);
+```
+
+## 案例一：等值查询间隙锁
+
+||session a|session b|session c|
+|:-|:-|:-|:-|
+|t1|begin;update t set d=d+1 where id=7;|||
+|t2||insert into t values(8,8,8)(blocked)||
+|t3|||update t set d=d+1 where id=10(ok)|
+
+1. 根据原则 1，加锁单位是 next-key lock，session A 加锁范围就是 (5,10]；
+2. 同时根据优化 2，这是一个等值查询 (id=7)，而 id=10 不满足查询条件，next-key lock 退化成间隙锁，因此最终加锁的范围是 (5,10)。
+
+所以，session B 要往这个间隙里面插入 id=8 的记录会被锁住，但是 session C 修改 id=10 这行是可以的。
+
+## 案例二：非唯一索引等值锁
+
+||session a|session b|session c|
+|:-|:-|:-|:-|
+|t1|begin;select id from t where c=5 lock in share mode;|||
+|t2||update t set d=d+1 where id=5;(ok)||
+|t3|||insert into t values(7,7,7)(blocked)|
+
+1. 这里 session A 要给索引 c 上 c=5 的这一行加上读锁。
+2. 根据原则 1，加锁单位是 next-key lock，因此会给 (0,5] 加上 next-key lock。
+3. 要注意 c 是普通索引，因此仅访问 c=5 这一条记录是不能马上停下来的，需要向右遍历，查到 c=10 才放弃。根据原则 2，访问到的都要加锁，因此要给 (5,10] 加 next-key lock。
+4. 但是同时这个符合优化 2：等值判断，向右遍历，最后一个值不满足 c=5 这个等值条件，因此退化成间隙锁 (5,10)。
+5. 根据原则 2 ，只有访问到的对象才会加锁，这个查询使用覆盖索引，并不需要访问主键索引，所以主键索引上没有加任何锁，这就是为什么 session B 的 update 语句可以执行完成。
+6. 但 session C 要插入一个 (7,7,7) 的记录，就会被 session A 的间隙锁 (5,10) 锁住。
+
+*需要注意，在这个例子中，lock in share mode 只锁覆盖索引，但是如果是 for update 就不一样了。 执行 for update 时，系统会认为你接下来要更新数据，因此会顺便给主键索引上满足条件的行加上行锁。*
+
+**这个例子说明，锁是加在索引上的；同时，它给我们的指导是，如果你要用 lock in share mode 来给行加读锁避免数据被更新的话，就必须得绕过覆盖索引的优化，在查询字段中加入索引中不存在的字段。比如，将 session A 的查询语句改成 select d from t where c=5 lock in share mode。你可以自己验证一下效果。**
+
+## 案例三：主键索引范围锁
+
+举例之前，你可以先思考一下这个问题：对于我们这个表 t，下面这两条查询语句，加锁范围相同吗？
+
+```sql
+mysql> select * from t where id=10 for update;
+mysql> select * from t where id>=10 and id<11 for update;
+```
+
+在逻辑上，这两条查语句肯定是等价的，但是它们的加锁规则不太一样。现在，我们就让 session A 执行第二个查询语句，来看看加锁效果。
+
+||session a|session b|session c|
+|:-|:-|:-|:-|
+|t1|begin;select * from t where id>=10 and id<11 for update;|||
+|t2||insert into t values(8,8,8)(ok);insert into t values(13,13,13)(blocked)||
+|t3|||update t set d=d+1 where id=15(blocked)|
+
+1. 开始执行的时候，要找到第一个 id=10 的行，因此本该是 next-key lock(5,10]。 根据优化 1， 主键 id 上的等值条件，退化成行锁，只加了 id=10 这一行的行锁。
+2. 范围查找就往后继续找，找到 id=15 这一行停下来，因此需要加 next-key lock(10,15]。
+
+所以，session A 这时候锁的范围就是主键索引上，行锁 id=10 和 next-key lock(10,15]。这样，session B 和 session C 的结果你就能理解了。
+
+这里你需要注意一点，首次 session A 定位查找 id=10 的行的时候，是当做等值查询来判断的，而向右扫描到 id=15 的时候，用的是范围查询判断。
+
+## 案例四：非唯一索引范围锁
+
+||session a|session b|session c|
+|:-|:-|:-|:-|
+|t1|begin;select * from t where c>=10 and c<11 for update;|||
+|t2||insert into t values(8,8,8)(blocked)||
+|t3|||update t set d=d+1 where c=15(blocked)|
+
+这次 session A 用字段 c 来判断，加锁规则跟案例三唯一的不同是：在第一次用 c=10 定位记录的时候，索引 c 上加了 (5,10] 这个 next-key lock 后，由于索引 c 是非唯一索引，没有优化规则，也就是说不会蜕变为行锁，因此最终 sesion A 加的锁是，索引 c 上的 (5,10] 和 (10,15] 这两个 next-key lock。
+
+所以从结果上来看，sesson B 要插入（8,8,8) 的这个 insert 语句时就被堵住了。
+
+这里需要扫描到 c=15 才停止扫描，是合理的，因为 InnoDB 要扫到 c=15，才知道不需要继续往后找了。
+
+## 案例五：唯一索引范围锁 bug
+
+前面的四个案例，我们已经用到了加锁规则中的两个原则和两个优化，接下来再看一个关于加锁规则中 bug 的案例。
+
+||session a|session b|session c|
+|:-|:-|:-|:-|
+|t1|begin;select * from t where id>10 and id<=15 for update;|||
+|t2||update t set d=d+1 where id=20(blocked)||
+|t3|||insert into t values(16,16,16)(blocked)|
+
+session A 是一个范围查询，按照原则 1 的话，应该是索引 id 上只加 (10,15] 这个 next-key lock，并且因为 id 是唯一键，所以循环判断到 id=15 这一行就应该停止了。
+
+但是实现上，InnoDB 会往前扫描到第一个不满足条件的行为止，也就是 id=20。而且由于这是个范围扫描，因此索引 id 上的 (15,20] 这个 next-key lock 也会被锁上。
+
+照理说，这里锁住 id=20 这一行的行为，其实是没有必要的。因为扫描到 id=15，就可以确定不用往后再找了。但实现上还是这么做了，因此我认为这是个 bug。
+
+我也曾找社区的专家讨论过，官方 bug 系统上也有提到，但是并未被 verified。所以，认为这是 bug 这个事儿，也只能算我的一家之言，如果你有其他见解的话，也欢迎你提出来。
+
+## 案例六：非唯一索引上存在"等值"的例子
+
+```sql
+mysql> insert into t values(30,10,30);
+```
+
+新插入的这一行 c=10，也就是说现在表里有两个 c=10 的行。那么，这时候索引 c 上的间隙是什么状态了呢？你要知道，由于非唯一索引上包含主键的值，所以是不可能存在“相同”的两行的。
+
+|column id|column c||
+|:-|:-|:-|
+|0|0|
+|5|5|
+|10|10|
+|30|10|
+|15|15|
+|20|20|
+|25|25|
+
+可以看到，虽然有两个 c=10，但是它们的主键值 id 是不同的（分别是 10 和 30），因此这两个 c=10 的记录之间，也是有间隙的。
+
+||session a|session b|session c|
+|:-|:-|:-|:-|
+|t1|begin;delete from t where c=10;|||
+|t2|||insert into t values(12,12,12)(blocked)|
+|t3||update t set d=d+1 where c=15(ok)||
+
+## 案例七：limit 语句加锁
+
+||session a|session b|
+|:-|:-|:-|
+|t1|begin;delete from t where c=10 limit 2;||
+|t2||insert into t values(12,12,12)(blocked)|
+
+这个例子里，session A 的 delete 语句加了 limit 2。你知道表 t 里 c=10 的记录其实只有两条，因此加不加 limit 2，删除的效果都是一样的，但是加锁的效果却不同。可以看到，session B 的 insert 语句执行通过了，跟案例六的结果不同。
+
+这是因为，案例七里的 delete 语句明确加了 limit 2 的限制，因此在遍历到 (c=10, id=30) 这一行之后，满足条件的语句已经有两条，循环就结束了。
+
+因此，索引 c 上的加锁范围就变成了从（c=5,id=5) 到（c=10,id=30) 这个前开后闭区间
+
+*这个例子对我们实践的指导意义就是，在删除数据的时候尽量加 limit。这样不仅可以控制删除数据的条数，让操作更安全，还可以减小加锁的范围。*
+
+## 案例八：一个死锁的例子
+
+|session a|session b|
+|:-|:-|
+|begin;select id from t where c=10 lock in share mode;||
+||update t set d=d+1 where c=10(blocked)|
+|insert into t values(8,8,8)(ok)||
+||error 1213|
+
+1. session A 启动事务后执行查询语句加 lock in share mode，在索引 c 上加了 next-key lock(5,10] 和间隙锁 (10,15)；
+2. session B 的 update 语句也要在索引 c 上加 next-key lock(5,10] ，进入锁等待；
+3. 然后 session A 要再插入 (8,8,8) 这一行，被 session B 的间隙锁锁住。由于出现了死锁，InnoDB 让 session B 回滚。
+
+其实是这样的，session B 的“加 next-key lock(5,10] ”操作，实际上分成了两步，先是加 (5,10) 的间隙锁，加锁成功；然后加 c=10 的行锁，这时候才被锁住的。
+
+## 小结
+
+*以前一直认为间隙锁只在二级索引上有。现在你知道了，有间隙的地方就可能有间隙锁。*
+
+
+
